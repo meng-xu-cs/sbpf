@@ -100,6 +100,10 @@ pub struct Interpreter<'a, 'b, C: ContextObject> {
     /// General purpose registers and pc
     pub reg: [u64; 12],
 
+    /// Solana coverage tracking
+    solcov_next: usize,
+    solcov_vals: [u32; 8],
+
     #[cfg(feature = "debugger")]
     pub(crate) debug_state: DebugState,
     #[cfg(feature = "debugger")]
@@ -124,6 +128,8 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
             debug_state: DebugState::Continue,
             #[cfg(feature = "debugger")]
             breakpoints: Vec::new(),
+            solcov_next: 0,
+            solcov_vals: [0; 8],
         }
     }
 
@@ -178,12 +184,11 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
         if config.enable_instruction_meter && self.vm.due_insn_count >= self.vm.previous_instruction_meter {
             throw_error!(self, EbpfError::ExceededMaxInstructions);
         }
+        self.vm.due_insn_count += 1;
         if self.reg[11] as usize * ebpf::INSN_SIZE >= self.program.len() {
             throw_error!(self, EbpfError::ExecutionOverrun);
         }
-        self.process_solcov();
 
-        self.vm.due_insn_count += 1;
         let mut next_pc = self.reg[11] + 1;
         let mut insn = ebpf::get_insn_unchecked(self.program, self.reg[11] as usize);
         let dst = insn.dst as usize;
@@ -192,6 +197,7 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
         if config.enable_instruction_tracing {
             self.vm.context_object_pointer.trace(self.reg);
         }
+        self.solcov_process(&insn);
 
         match insn.opc {
             ebpf::LD_DW_IMM if !self.executable.get_sbpf_version().disable_lddw() => {
@@ -601,67 +607,86 @@ impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
     }
 }
 
+enum ScovItem {
+    None,
+    Init,
+    Fini,
+    Value(u32),
+}
+
 impl<'a, 'b, C: ContextObject> Interpreter<'a, 'b, C> {
+    /// Markers
+    const MARKER1: u32 = 0x73_63_6F_76; // "scov"
+    const MARKER2: u32 = 0x56_4F_53_43; // "VOSC" ("scov" spelled backwards in uppercase)
+
     /// Coverage kind for PC tracking
     const COV_KIND_PC: u16 = 1;
 
     #[inline]
-    fn is_solcov_store(insn: &ebpf::Insn) -> bool {
+    fn solcov_parse(insn: &ebpf::Insn) -> ScovItem {
         // *(frame_ptr - 4) = <imm>
-        insn.opc == ebpf::ST_W_IMM && insn.dst == (ebpf::FRAME_PTR_REG as u8) && insn.off == -4
+        if insn.opc == ebpf::ST_W_IMM && insn.dst == (ebpf::FRAME_PTR_REG as u8) && insn.off == -4 {
+            match insn.imm as u32 {
+                Self::MARKER1 => ScovItem::Init,
+                Self::MARKER2 => ScovItem::Fini,
+                v => ScovItem::Value(v),
+            }
+        } else {
+            ScovItem::None
+        }
     }
 
-    #[inline]
-    fn read_solcov_value(&self, pc: &mut usize) -> u32 {
-        let insn = ebpf::get_insn_unchecked(self.program, *pc);
-        assert!(Self::is_solcov_store(&insn));
-        *pc += 1;
-        insn.imm as u32
-    }
-
-    // Process solcov markers
-    fn process_solcov(&mut self) {
-        // peek at the instruction
-        let mut pc = self.reg[11] as usize;
-        let insn = ebpf::get_insn_unchecked(self.program, pc);
-
-        // marker 1
-        if insn.imm == 0x63_6c_6f_73 && Self::is_solcov_store(&insn) {
-            pc += 1;
-
-            // marker 2
-            let next_insn = ebpf::get_insn_unchecked(self.program, pc);
-            if next_insn.imm & 0x0000_ffff == 0x0000766f && Self::is_solcov_store(&next_insn) {
-                pc += 1;
-
-                // handle by coverage kind
-                let kind = (next_insn.imm >> 16) as u16;
-                match kind {
-                    Self::COV_KIND_PC => {
-                        // crate id
-                        let crate_id1 = self.read_solcov_value(&mut pc);
-                        let crate_id2 = self.read_solcov_value(&mut pc);
-                        // local id
-                        let local_id1 = self.read_solcov_value(&mut pc);
-                        let local_id2 = self.read_solcov_value(&mut pc);
-                        // block id
-                        let func_id = (crate_id1 as u128) << 96
-                            | (crate_id2 as u128) << 64
-                            | (local_id1 as u128) << 32
-                            | local_id2 as u128;
-                        let block_id = self.read_solcov_value(&mut pc);
-                        log::debug!("[solcov] pc coverage: ({func_id:032x}, {block_id})");
-                    }
-                    _ => panic!("[solcov] unknown coverage marker kind {:x}", kind),
+    fn solcov_process(&mut self, insn: &ebpf::Insn) {
+        match Self::solcov_parse(insn) {
+            ScovItem::None => (),
+            ScovItem::Init => {
+                if self.solcov_next != 0 {
+                    panic!("[solcov] session started without being ended");
                 }
-
-                // update the pc to point to the next instruction
-                self.reg[11] = pc as u64;
-            } else {
-                log::warn!("[solcov] unexpected follow-up insn after 'solc' {next_insn:?}");
+                self.solcov_next = 1;
+            }
+            ScovItem::Fini => {
+                if self.solcov_next == 0 {
+                    panic!("[solcov] session ended without being started");
+                }
+                self.solcov_finalize();
+                self.solcov_next = 0;
+            }
+            ScovItem::Value(v) => {
+                if self.solcov_next != 0 {
+                    self.solcov_vals[self.solcov_next] = v;
+                    self.solcov_next += 1;
+                }
             }
         }
+    }
 
-        // do nothing if this is not related to solcov
+    fn solcov_finalize(&self) {
+        assert_eq!(self.solcov_vals[0], 0);
+
+        // parse kind
+        let test = self.solcov_vals[1];
+        assert_eq!((test >> 16) as u16, 0x74_79);
+        let kind = (test & 0x0000_FFFF) as u16;
+
+        // switch based on kind
+        match kind {
+            Self::COV_KIND_PC => {
+                // crate id
+                let crate_id1 = self.solcov_vals[2];
+                let crate_id2 = self.solcov_vals[3];
+                // local id
+                let local_id1 = self.solcov_vals[4];
+                let local_id2 = self.solcov_vals[5];
+                // block id
+                let func_id = (crate_id1 as u128) << 96
+                    | (crate_id2 as u128) << 64
+                    | (local_id1 as u128) << 32
+                    | local_id2 as u128;
+                let block_id = self.solcov_vals[6];
+                log::debug!("[solcov] pc coverage: ({func_id:032x}, {block_id})");
+            }
+            _ => panic!("[solcov] unknown coverage marker kind {:x}", kind),
+        }
     }
 }
